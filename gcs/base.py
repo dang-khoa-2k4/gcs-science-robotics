@@ -112,6 +112,16 @@ class BaseGCS:
 
         return source_edges, target_edges
 
+    # bool ConvexSet::IntersectsWith(const ConvexSet& other) const {
+    # DRAKE_THROW_UNLESS(other.ambient_dimension() == this->ambient_dimension());
+    # solvers::MathematicalProgram prog{};
+    # const auto& x = prog.NewContinuousVariables(this->ambient_dimension(), "x");
+    # this->AddPointInSetConstraints(&prog, x);
+    # other.AddPointInSetConstraints(&prog, x);
+    # solvers::MathematicalProgramResult result = solvers::Solve(prog);
+    # return result.is_success();
+    # }
+
     def findEdgesViaOverlaps(self):
         edges = []
         for ii in range(len(self.regions)):

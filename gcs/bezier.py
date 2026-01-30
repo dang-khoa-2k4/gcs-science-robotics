@@ -349,7 +349,7 @@ class BezierGCS(BaseGCS):
 
         path = BsplineTrajectory(BsplineBasis(self.order + 1, knots), path_control_points)
         time_traj = BsplineTrajectory(BsplineBasis(self.order + 1, knots), time_control_points)
-
+    
         return BezierTrajectory(path, time_traj), results_dict
 
 class BezierTrajectory:
