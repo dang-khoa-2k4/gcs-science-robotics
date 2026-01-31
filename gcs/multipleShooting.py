@@ -92,51 +92,54 @@ class MultipleShootingGCS(BaseGCS):
 
     def findMultipleShootingTraj(self, waypoints, path_regions, verbose=False):
         """
-        Multiple Shooting với ràng buộc vùng lồi từ GCS.
+        Multiple Shooting trajectory optimization with convex region constraints.
         
         Args:
-            waypoints: Các điểm giao (facets) giữa vùng lồi từ GCS [dim x num_waypoints]
-            path_regions: Danh sách các vùng lồi (ConvexSet) trên đường đi
-            verbose: In thông tin debug
-            obstacles: Danh sách obstacles để visualize (optional)
+            waypoints: Intersection points (facets) between convex regions [dim x num_waypoints]
+            path_regions: List of convex sets (ConvexSet) defining the safe corridor
+            verbose: Boolean flag to enable debug output
         
         Returns:
-            dict chứa trajectory tối ưu
+            dict: Dictionary containing the optimized trajectory states, controls, and costs
         """
-        dt = getattr(self, 'dt', 0.1)  # Time step
-        nx, nu = 4, 2  # Unicycle: [px, py, v, θ], [a, ω]
+        dt = getattr(self, 'dt', 0.1)  # Discretization time step
+        nx, nu = 4, 2  # State: [px, py, v, theta], Control: [a, omega]
         
         num_regions = len(path_regions)
         intervals_per_region = getattr(self, 'intervals_per_region', 15)
-        N = num_regions * intervals_per_region  # Tổng số shooting intervals
+        N = num_regions * intervals_per_region  # Total shooting intervals
         
-        # Điểm đầu và cuối
+        # Initial and goal state definitions
         x_start = np.array([waypoints[0, 0], waypoints[1, 0], 0.0, 0.0])
         x_goal = np.array([waypoints[0, -1], waypoints[1, -1], 0.0, 0.0])
 
-        # ========== Định nghĩa động lực học Unicycle ==========
+        # ========== Unicycle Kinematics Definition ==========
         x = ca.MX.sym('x', nx)
         u = ca.MX.sym('u', nu)
         
         px, py, v, theta = x[0], x[1], x[2], x[3]
         a, omega = u[0], u[1]
 
-        # Lấy tham số từ config
-        w_a = self.weights.get('a', 1.0) if hasattr(self, 'weights') else 1.0
+        # Weighting factors and physical limits from configuration
+        w_a = self.weights.get('a', 1e-1) if hasattr(self, 'weights') else 1e-1
         w_omega = self.weights.get('omega', 1.0) if hasattr(self, 'weights') else 1.0
+        w_time = self.weights.get('time', 1.0) if hasattr(self, 'weights') else 1.0
         a_max = self.control_limits.get('a_max', 3.0) if hasattr(self, 'control_limits') else 3.0
         omega_max = self.control_limits.get('omega_max', np.pi) if hasattr(self, 'control_limits') else np.pi
-        v_max = self.control_limits.get('v_max', 5.0) if hasattr(self, 'control_limits') else 5.0
+        v_max = self.control_limits.get('v_max', 2.0) if hasattr(self, 'control_limits') else 5.0
+        dt_min = self.control_limits.get('dt_min', 0.01) if hasattr(self, 'control_limits') else 0.01
+        dt_max = self.control_limits.get('dt_max', 0.5) if hasattr(self, 'control_limits') else 0.5
 
+        # Continuous-time dynamics: x_dot = f(x, u)
         x_dot = ca.vertcat(
-            v * ca.cos(theta),   # ṗx = v·cos(θ)
-            v * ca.sin(theta),   # ṗy = v·sin(θ)
-            a,                   # v̇ = a
-            omega                # θ̇ = ω
+            v * ca.cos(theta),   # px_dot = v * cos(theta)
+            v * ca.sin(theta),   # py_dot = v * sin(theta)
+            a,                   # v_dot = a
+            omega                # theta_dot = omega
         )
         f = ca.Function('f', [x, u], [x_dot])
         
-        # RK4 integrator
+        # RK4 Integrator for discrete-time dynamics
         def rk4_step(f, x, u, dt):
             k1 = f(x, u)
             k2 = f(x + dt/2 * k1, u)
@@ -144,69 +147,73 @@ class MultipleShootingGCS(BaseGCS):
             k4 = f(x + dt * k3, u)
             return x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
 
-        # ========== Xây dựng NLP (Multiple Shooting) ==========
+        # ========== NLP Construction (Multiple Shooting) ==========
         opti = ca.Opti()
         
-        X = opti.variable(nx, N+1)   # Trạng thái tại N+1 điểm
-        U = opti.variable(nu, N)     # Điều khiển tại N đoạn
+        X = opti.variable(nx, N+1)   # State variables for N+1 nodes
+        U = opti.variable(nu, N)     # Control variables for N intervals
+        DT = opti.variable(N)   # Time step variables for N intervals
 
-        # Hàm mục tiêu: cực tiểu năng lượng điều khiển
+        # Objective Function: Minimize control effort (energy)
+        total_time = 0
         cost = 0
         for k in range(N):
-            cost += w_a * U[0, k]**2 + w_omega * U[1, k]**2
-        opti.minimize(cost * dt)
-
-        # ========== RÀNG BUỘC ==========
+            cost += (w_a * U[0, k]**2 + w_omega * U[1, k]**2) * DT[k]
+            total_time += DT[k]
+        cost += w_time * total_time 
+        opti.minimize(cost)
         
-        # 1. Ràng buộc biên (Boundary constraints)
+        # 1. Boundary Constraints
         opti.subject_to(X[:, 0] == x_start)
-        opti.subject_to(X[:2, N] == x_goal[:2])  # Chỉ ràng buộc vị trí cuối
+        opti.subject_to(X[:, N] == x_goal)
 
-        # 2. Ràng buộc động lực học (Defect/Continuity constraints)
+        # 2. Shooting Constraints (Dynamics Continuity)
         for k in range(N):
             x_next = rk4_step(f, X[:, k], U[:, k], dt)
             opti.subject_to(X[:, k+1] == x_next)
 
-        # 3. RÀNG BUỘC VÙNG LỒI (Convex Region Constraints)
-        # Mỗi nhóm đoạn k ∈ {n_i, ..., n_{i+1}} phải nằm trong vùng Q_i
-        # Ràng buộc: A_i * [px, py] <= b_i
+        # 3. Convex Region Constraints (Corridor Constraints)
+        # Each segment group k in {n_i, ..., n_{i+1}} must stay within Q_i
+        # Constraint formulation: A_i * [px, py]^T <= b_i
         for region_idx, region in enumerate(path_regions):
-            # Xác định các node thuộc vùng này
+            # Define node indices assigned to this convex region
             k_start = region_idx * intervals_per_region
             k_end = (region_idx + 1) * intervals_per_region
             
-            # Bỏ qua nếu region là Point (source/target) - đã có boundary constraints
+            # Skip if region is a Point (handled by boundary constraints)
             if isinstance(region, Point):
                 continue
             
-            # Lấy ma trận A, b của vùng lồi (HPolyhedron)
-            A = np.array(region.A())[:, :2]  # Chỉ lấy 2 cột đầu (px, py)
+            # Extract H-representation matrices (A, b)
+            # Only consider the first two columns for (px, py) spatial constraints
+            A = np.array(region.A())[:, :2] 
             b = np.array(region.b())
             
             for k in range(k_start, min(k_end + 1, N + 1)):
-                # Ràng buộc: A * [px, py]^T <= b
-                pos_k = X[:2, k]  # Chỉ vị trí [px, py]
+                pos_k = X[:2, k]
                 opti.subject_to(A @ pos_k <= b)
 
-        # 4. Giới hạn điều khiển và trạng thái
+        # 4. Actuation and State Limits
         opti.subject_to(opti.bounded(-a_max, U[0, :], a_max))
         opti.subject_to(opti.bounded(-omega_max, U[1, :], omega_max))
-        opti.subject_to(opti.bounded(0, X[2, :], v_max))  # v >= 0
+        opti.subject_to(opti.bounded(0, X[2, :], v_max))  # Non-negative velocity limit
 
-        # ========== WARM START từ GCS waypoints ==========
-        # Nội suy waypoints để khởi tạo cho tất cả N+1 nodes
+        # 5. Time step bounds
+        opti.subject_to(opti.bounded(dt_min, DT, dt_max))
+
+        # ========== Initial Guess (Warm Start) from GCS Waypoints ==========
+        # Interpolate waypoints to initialize N+1 nodes
         for k in range(N + 1):
-            # Tìm waypoint gần nhất và nội suy
             region_idx = min(k // intervals_per_region, num_regions - 1)
             local_k = k - region_idx * intervals_per_region
             alpha = local_k / intervals_per_region
             
             if region_idx < num_regions - 1:
-                # Nội suy giữa waypoint[region_idx] và waypoint[region_idx+1]
+                # Linear interpolation between sequential waypoints
                 wp_start = waypoints[:, region_idx]
                 wp_end = waypoints[:, region_idx + 1]
             else:
-                # Đoạn cuối: nội suy đến goal
+                # Final segment: interpolate towards the goal state
                 wp_start = waypoints[:, -1] if region_idx < waypoints.shape[1] else waypoints[:, -1]
                 wp_end = x_goal[:2]
             
@@ -215,12 +222,13 @@ class MultipleShootingGCS(BaseGCS):
             opti.set_initial(X[:, k], x_init)
         
         opti.set_initial(U, 0)
+        opti.set_initial(DT, dt)  # Initialize with nominal dt
 
-        # ========== Lưu lại quá trình hội tụ ==========
+        # ========== Convergence History Tracking ==========
         iteration_history = []
         
         def callback(i):
-            """Callback để lưu trạng thái mỗi iteration"""
+            """Callback function to store solver state at each iteration"""
             try:
                 X_current = opti.debug.value(X)
                 cost_current = opti.debug.value(cost * dt)
@@ -231,11 +239,11 @@ class MultipleShootingGCS(BaseGCS):
                 })
             except:
                 pass
-            return False  # Tiếp tục tối ưu
+            return False  # Continue optimization
         
         opti.callback(callback)
 
-        # ========== Giải NLP ==========
+        # ========== NLP Solver Invocation ==========
         opts = {'ipopt': {'print_level': 3 if verbose else 0, 'max_iter': 500}}
         opti.solver('ipopt', opts)
 

@@ -5,7 +5,7 @@ matplotlib.use('Agg')  # Non-interactive backend
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
-N = 50       # Number of shooting intervals
+N = 45       # Number of shooting intervals
 dt = 0.1            # Time step
 nx, nu = 4, 2       # Number of state and control variables
 
@@ -48,6 +48,16 @@ def rk4_step(f, x, u, dt):
     k4 = f(x + dt * k3, u)
     return x + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
 
+def rk4_intermediate_points(f, x, u, dt):
+    """Trả về các điểm trung gian trong bước RK4 để kiểm tra va chạm."""
+    k1 = f(x, u)
+    x1 = x + dt/2 * k1          # Điểm tại t + dt/2 (lần 1)
+    k2 = f(x1, u)
+    x2 = x + dt/2 * k2          # Điểm tại t + dt/2 (lần 2)  
+    k3 = f(x2, u)
+    x3 = x + dt * k3            # Điểm tại t + dt (trước khi trung bình)
+    return [x1, x2, x3]
+
 opti = ca.Opti()
 
 # decision variables: states at each node and controls at each interval
@@ -84,16 +94,11 @@ opti.subject_to(opti.bounded(-v_max, X[2, :], v_max))
 # Straight line from A to B as initial guess
 for k in range(N+1):
     alpha = k / N
-    # offset = 3.0 * np.sin(np.pi * alpha)  # Cung tròn lách qua
     x_init = (1-alpha)*x_start + alpha*x_goal
-    # x_init[1] += offset  # Dịch lên trên
     opti.set_initial(X[:, k], x_init)
 opti.set_initial(U, 0)
 
-
-
-
-# ========== Lưu lại quá trình hội tụ ==========
+# ========== Callback to store iteration history ==========
 iteration_history = []
 
 def callback(i):
